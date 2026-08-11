@@ -1,5 +1,5 @@
 // do a sync :O
-use std::{cmp::Ordering, fmt::Write};
+use std::{cmp::Ordering, fmt::Write, sync::Arc};
 
 use eyre::Result;
 use thiserror::Error;
@@ -12,6 +12,7 @@ use crate::{
 };
 
 use atuin_common::encryption::paseto_v4;
+use atuin_domain::caps::CapClient;
 use atuin_domain::record::{Diff, HostId, RecordId, RecordIdx, RecordStatus};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 
@@ -62,7 +63,7 @@ pub enum Operation {
     },
 }
 
-pub async fn build_client(settings: &Settings) -> Result<Client, SyncError> {
+pub async fn build_client(settings: &Settings, caps: Arc<CapClient>) -> Result<Client, SyncError> {
     Client::new(
         settings.sync_address.clone(),
         settings
@@ -72,6 +73,7 @@ pub async fn build_client(settings: &Settings) -> Result<Client, SyncError> {
         settings.network_connect_timeout,
         settings.network_timeout,
         &settings.extra_headers,
+        caps,
     )
     .map_err(|e| SyncError::OperationalError { msg: e.to_string() })
 }
@@ -165,8 +167,8 @@ pub async fn operations(
         Operation::Noop { host, tag } => (0u8, *host, 0u8, tag.clone()),
         Operation::Upload { host, tag, .. } => (1u8, *host, 0u8, tag.clone()),
         Operation::Download { host, tag, .. } => {
-            // Packfile manifests must expand before the history download runs, so the history
-            // records they populate are skipped by the live-head dedup in sync_download.
+            // Packfile manifests must expand before the history download runs, as that
+            // `sync_download` will dedupe will have a chance at avoiding unnecessary downloads.
             let tag_priority = if tag == PACKFILE_TAG { 0u8 } else { 1u8 };
             (2u8, *host, tag_priority, tag.clone())
         }
@@ -268,17 +270,14 @@ async fn sync_download(
     page_size: u64,
     key: &paseto_v4::Key,
 ) -> Result<Vec<RecordId>, SyncError> {
-    // Re-derive the local head from the store at execution time. An earlier packfile expansion in
-    // this same sync may have populated records for this (host, tag); starting from the frozen
-    // diff value would re-download the range those packfiles already covered.
-    // Note: as with the pre-existing incremental-download boundary behavior below, the record at
-    // idx == this re-derived `local` gets re-requested by the first loose page (start = local +
-    // 0); that's harmless since `push_batch` is an insert-or-ignore upsert on id.
+    // Re-query the current state of the store. A previous `sync_download` with `tag == MANIFEST`
+    // may have downloaded new records that we now need to skip downloading.
     let local = match store.last(host, &tag).await {
         Ok(Some(record)) => record.idx.max(local.unwrap_or(0)),
         Ok(None) => local.unwrap_or(0),
         Err(e) => return Err(SyncError::LocalStoreError { msg: e.to_string() }),
     };
+
     // Saturating: the live-derived `local` head (above) can exceed the `remote` snapshot taken at
     // the start of `sync()` if a concurrent upload from another device landed in between -- a
     // plain subtraction would underflow (panic in debug, wrap in release).
@@ -452,11 +451,12 @@ pub async fn sync(
     settings: &Settings,
     store: &SqliteStore,
     encryption_key: &paseto_v4::Key,
+    caps: Arc<CapClient>,
 ) -> Result<(i64, Vec<RecordId>), SyncError> {
-    let client = build_client(settings).await?;
+    let client = build_client(settings, caps).await?;
 
-    // `Client::new` has already kicked off the capability fetch in the background, so the packfile
-    // gate in `sync_remote` (`packfiles_enabled`) either reads it warm or blocks on it in flight.
+    // The injected `caps` reader warms itself in the background, so the packfile gate in
+    // `sync_remote` (`packfiles_enabled`) either reads it warm or blocks on it in flight.
 
     let (diff, remote_index) = diff(&client, store).await?;
 
@@ -763,7 +763,7 @@ mod packfile_download_tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::api_client::{AuthToken, Client};
+    use crate::api_client::{AuthToken, Client, caps_client};
     use crate::history::HISTORY_TAG;
     use crate::packfile::PackManifestRecordView;
     use crate::packfile::{PACKFILE_TAG, try_pack};
@@ -780,12 +780,14 @@ mod packfile_download_tests {
 
     /// A [`Client`] pointed at a wiremock server, authenticated with a dummy token.
     pub(super) fn mock_client(addr: &url::Url) -> Client {
+        let caps = caps_client(addr, &HashMap::new()).unwrap();
         Client::new(
             addr.clone(),
             AuthToken::Token("t".into()),
             30,
             30,
             &HashMap::new(),
+            caps,
         )
         .unwrap()
     }

@@ -12,9 +12,10 @@
 use std::sync::Arc;
 
 use atuin_client::{
-    database::Sqlite as HistoryDatabase, record::sqlite_store::SqliteStore, settings::Settings,
+    api_client::caps_client, database::Sqlite as HistoryDatabase,
+    record::sqlite_store::SqliteStore, settings::Settings,
 };
-use atuin_common::{encryption::paseto_v4, url::UrlAppendExt};
+use atuin_common::encryption::paseto_v4;
 use atuin_domain::caps::CapClient;
 use enum_dispatch::enum_dispatch;
 use eyre::{Context, Result};
@@ -463,14 +464,11 @@ impl DaemonBuilder {
         // Create the event bus
         let (event_tx, _) = broadcast::channel(64);
 
-        // Build the capability reader against the public capabilities endpoint.
-        let caps = CapClient::new(
-            self.settings
-                .sync_address
-                .append_path("api/v0/capabilities")
-                .context("invalid sync address for the capabilities endpoint")?,
-            reqwest::Client::new(),
-        );
+        // One capability reader for the whole daemon: shared by the history component's packing
+        // path and injected into every sync tick's client, so the server is only polled by one
+        // warmer.
+        let caps = caps_client(&self.settings.sync_address, &self.settings.extra_headers)
+            .context("failed to build the capability reader")?;
 
         // Create the shared state
         let state = Arc::new(DaemonState {

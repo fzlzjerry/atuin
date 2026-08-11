@@ -248,6 +248,25 @@ async fn handle_resp_error(resp: Response) -> Result<Response> {
     Ok(resp)
 }
 
+/// Build the capability reader for a sync server.
+pub fn caps_client(
+    sync_addr: &Url,
+    extra_headers: &HashMap<String, String>,
+) -> Result<Arc<CapClient>> {
+    let mut headers = extra_headers_map(extra_headers)?;
+    headers.insert(USER_AGENT, APP_USER_AGENT.parse()?);
+    headers.insert(ATUIN_HEADER_VERSION, ATUIN_CARGO_VERSION.parse()?);
+
+    let http = client_builder(extra_headers)
+        .default_headers(headers)
+        .build()?;
+
+    Ok(CapClient::new(
+        sync_addr.append_path("api/v0/capabilities")?,
+        http,
+    ))
+}
+
 impl Client {
     pub fn new(
         sync_addr: impl Into<Arc<Url>>,
@@ -255,6 +274,7 @@ impl Client {
         connect_timeout: u64,
         timeout: u64,
         extra_headers: &HashMap<String, String>,
+        caps: Arc<CapClient>,
     ) -> Result<Self> {
         let sync_addr: Arc<Url> = sync_addr.into();
 
@@ -265,27 +285,13 @@ impl Client {
         // used for semver server check
         headers.insert(ATUIN_HEADER_VERSION, ATUIN_CARGO_VERSION.parse()?);
 
-        // Base authenticated client. `client` wraps it in CapMiddleware for the negotiated API;
-        // `CapClient` keeps a bare clone for its own capability fetches (the caps route is
-        // unnegotiated, so it must bypass the middleware).
-        let base = client_builder(extra_headers)
+        // Wrap the authenticated client in the capability-negotiation middleware.
+        let client = client_builder(extra_headers)
             .default_headers(headers)
             .connect_timeout(Duration::from_secs(connect_timeout))
             .timeout(Duration::from_secs(timeout))
-            .build()?;
-
-        // `CapClient::new` eagerly kicks off the capability fetch in the background, so the packfile
-        // gate has an answer ready (or blocks on the in-flight fetch) by the first sync.
-        let caps = CapClient::new(sync_addr.append_path("api/v0/capabilities")?, base.clone());
-        // A node's own `record_count` is inert -- it is never sent, and only the server's advertised
-        // value governs packing (see `packfile_record_count`), so 0 is a fine placeholder here.
-        caps.add(PackfileCap {
-            version: 1,
-            record_count: 0,
-        })
-        .expect("packfile cap registered once");
-
-        let client = base.with_capabilities(caps.clone(), CapMismatch::Continue);
+            .build()?
+            .with_capabilities(caps.clone(), CapMismatch::Continue);
 
         Ok(Client {
             sync_addr,
@@ -404,7 +410,7 @@ impl Client {
         Ok(parsed.download_url)
     }
 
-    /// Dowload the packfile for the given manifest id.
+    /// Download the packfile for the given manifest id.
     pub async fn get_packfile(&self, manifest_id: RecordId) -> Result<Vec<u8>> {
         let download_url = self.get_packfile_download_url(manifest_id).await?;
         let resp = self.upload_client.get(download_url).send().await?;
@@ -636,8 +642,16 @@ mod tests {
             .await;
 
         let addr: Url = server.uri().parse().unwrap();
-        let client =
-            Client::new(addr, AuthToken::Token("t".into()), 30, 30, &HashMap::new()).unwrap();
+        let caps = caps_client(&addr, &HashMap::new()).unwrap();
+        let client = Client::new(
+            addr,
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+            caps,
+        )
+        .unwrap();
 
         assert!(client.packfiles_enabled().await);
         // A second read stays warm (the mock expects a single fetch) and exposes the pack size.
