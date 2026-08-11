@@ -278,9 +278,6 @@ async fn sync_download(
         Err(e) => return Err(SyncError::LocalStoreError { msg: e.to_string() }),
     };
 
-    // Saturating: the live-derived `local` head (above) can exceed the `remote` snapshot taken at
-    // the start of `sync()` if a concurrent upload from another device landed in between -- a
-    // plain subtraction would underflow (panic in debug, wrap in release).
     let expected = remote.saturating_sub(local);
     let mut progress = 0;
     let mut ret = Vec::new();
