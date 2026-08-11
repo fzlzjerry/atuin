@@ -12,7 +12,7 @@ use crate::{
 };
 
 use atuin_common::encryption::paseto_v4;
-use atuin_domain::caps::CapClient;
+use atuin_domain::caps::{CapClient, PackfileCap};
 use atuin_domain::record::{Diff, HostId, RecordId, RecordIdx, RecordStatus};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 
@@ -350,7 +350,12 @@ pub async fn sync_remote(
     let mut uploaded = 0;
     let mut downloaded = Vec::new();
 
-    let packfiles_enabled = client.packfiles_enabled().await;
+    // The server advertises usable packfile support: it advertises `PackfileCap` with a positive
+    // `record_count`. Gates the packfile upload/download path below.
+    let packfiles_enabled = matches!(
+        client.caps().get_server::<PackfileCap>().await,
+        Ok(Some(cap)) if cap.record_count > 0
+    );
 
     // this can totally run in parallel, but lets get it working first
     for i in operations {

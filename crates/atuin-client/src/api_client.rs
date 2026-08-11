@@ -16,7 +16,7 @@ use atuin_domain::api::{
     LoginRequest, LoginResponse, MeResponse, PackfileDownloadResponse, PackfileResponse,
     RegisterResponse,
 };
-use atuin_domain::caps::{CapClient, CapMismatch, CapabilitiesExt, PackfileCap};
+use atuin_domain::caps::{CapClient, CapMismatch, CapabilitiesExt};
 use atuin_domain::record::{EncryptedData, HostId, Record, RecordId, RecordIdx, RecordStatus};
 
 use reqwest_middleware::ClientWithMiddleware;
@@ -304,24 +304,9 @@ impl Client {
         })
     }
 
-    /// How many history records the server wants bundled into each packfile, or `None` if the
-    /// server does not advertise usable packfile support -- its capabilities are unfetched, it does
-    /// not advertise [`PackfileCap`], the advertisement is malformed, or the advertised count is
-    /// zero.
-    ///
-    /// Blocks on the eager capability warm-up kicked off in [`Self::new`] if it is still in flight;
-    /// otherwise a pure cache read. This is the source of the pack size -- `None` means "do not
-    /// pack", the same condition under which the sync path skips packfile upload/download.
-    pub async fn packfile_record_count(&self) -> Option<u64> {
-        match self.caps.get_server::<PackfileCap>().await {
-            Ok(Some(cap)) if cap.record_count > 0 => Some(cap.record_count),
-            _ => None,
-        }
-    }
-
-    /// Whether the server has confirmed it supports packfiles.
-    pub async fn packfiles_enabled(&self) -> bool {
-        self.packfile_record_count().await.is_some()
+    /// The capability reader this client negotiates against.
+    pub fn caps(&self) -> &Arc<CapClient> {
+        &self.caps
     }
 
     pub async fn me(&self) -> Result<MeResponse> {
@@ -619,7 +604,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn bootstrap_enables_packfiles_then_is_idempotent() {
-        use atuin_domain::caps::{CapServer, CapabilitiesCap};
+        use atuin_domain::caps::{CapServer, CapabilitiesCap, PackfileCap};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -653,8 +638,21 @@ mod tests {
         )
         .unwrap();
 
-        assert!(client.packfiles_enabled().await);
-        // A second read stays warm (the mock expects a single fetch) and exposes the pack size.
-        assert_eq!(client.packfile_record_count().await, Some(500));
+        // The client observes the server's advertised packfile cap; a second read stays warm
+        // (the mock expects a single capabilities fetch).
+        assert_eq!(
+            client.caps().get_server::<PackfileCap>().await.unwrap(),
+            Some(PackfileCap {
+                version: 1,
+                record_count: 500,
+            })
+        );
+        assert_eq!(
+            client.caps().get_server::<PackfileCap>().await.unwrap(),
+            Some(PackfileCap {
+                version: 1,
+                record_count: 500,
+            })
+        );
     }
 }
