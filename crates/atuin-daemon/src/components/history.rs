@@ -6,10 +6,12 @@ use std::{pin::Pin, sync::Arc};
 
 use atuin_client::{
     database::Database,
-    history::{History, HistoryId, store::HistoryStore},
+    history::{HISTORY_TAG, History, HistoryId, store::HistoryStore},
+    packfile,
     settings::Settings,
 };
 use atuin_common::time::OffsetDateTimeExt;
+use atuin_domain::caps::PackfileCap;
 use dashmap::DashMap;
 use eyre::Result;
 use time::OffsetDateTime;
@@ -230,6 +232,28 @@ impl HistorySvc for HistoryGrpcService {
                 .push(history.clone())
                 .await
                 .map_err(|e| Status::internal(format!("failed to push record to store: {e:?}")))?;
+
+            // Pack accumulated history into manifest records on every addition, sized by the
+            // server-advertised packfile record count. When the server does not advertise usable
+            // packfile support (unfetched, absent, malformed, or a zero count) there is nothing to
+            // size packing by, so we skip it. Best-effort: a packing failure must not fail the
+            // history write.
+            let record_count = match handle.caps().get_server::<PackfileCap>().await {
+                Ok(Some(cap)) if cap.record_count > 0 => Some(cap.record_count),
+                _ => None,
+            };
+            if let Some(record_count) = record_count {
+                if let Err(e) = packfile::try_pack(
+                    &history_store.store,
+                    history_store.host_id,
+                    record_count,
+                    HISTORY_TAG,
+                )
+                .await
+                {
+                    tracing::warn!("packing failed: {e}");
+                }
+            }
 
             // Emit the event
             handle.emit(DaemonEvent::HistoryEnded(history));

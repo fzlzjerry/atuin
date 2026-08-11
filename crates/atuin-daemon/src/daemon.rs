@@ -14,7 +14,8 @@ use std::sync::Arc;
 use atuin_client::{
     database::Sqlite as HistoryDatabase, record::sqlite_store::SqliteStore, settings::Settings,
 };
-use atuin_common::encryption::paseto_v4;
+use atuin_common::{encryption::paseto_v4, url::UrlAppendExt};
+use atuin_domain::caps::CapClient;
 use enum_dispatch::enum_dispatch;
 use eyre::{Context, Result};
 use tokio::sync::{RwLock, broadcast};
@@ -43,6 +44,10 @@ pub struct DaemonState {
     // Database handles
     history_db: HistoryDatabase,
     store: SqliteStore,
+
+    // Reads the server's advertised capabilities (e.g. the packfile record count). Warms itself in
+    // the background against the public `/api/v0/capabilities` endpoint, so no auth is required.
+    caps: Arc<CapClient>,
 }
 
 // ============================================================================
@@ -151,6 +156,17 @@ impl DaemonHandle {
     /// Get a reference to the record store.
     pub fn store(&self) -> &SqliteStore {
         &self.state.store
+    }
+
+    // ---- Capabilities ----
+
+    /// Get the capability reader for the configured sync server.
+    ///
+    /// Reads the server's advertised capabilities (e.g. the packfile record count). Warms itself in
+    /// the background, so an early read may block briefly on the first fetch and a missing/offline
+    /// server reads as "no capabilities".
+    pub fn caps(&self) -> &Arc<CapClient> {
+        &self.state.caps
     }
 }
 
@@ -452,6 +468,16 @@ impl DaemonBuilder {
         // Create the event bus
         let (event_tx, _) = broadcast::channel(64);
 
+        // Build the capability reader against the public capabilities endpoint. It warms itself in
+        // the background; a missing/offline server leaves it empty, which reads as "do not pack".
+        let caps = CapClient::new(
+            self.settings
+                .sync_address
+                .append_path("api/v0/capabilities")
+                .context("invalid sync address for the capabilities endpoint")?,
+            reqwest::Client::new(),
+        );
+
         // Create the shared state
         let state = Arc::new(DaemonState {
             event_tx,
@@ -459,6 +485,7 @@ impl DaemonBuilder {
             encryption_key,
             history_db,
             store,
+            caps,
         });
 
         // Create the handle (just a reference to the state)

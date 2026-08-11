@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::env;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,10 +13,13 @@ use reqwest::{
 use atuin_common::url::UrlAppendExt;
 use atuin_domain::api::{
     ATUIN_CARGO_VERSION, ATUIN_HEADER_VERSION, ATUIN_VERSION, ChangePasswordRequest, ErrorResponse,
-    LoginRequest, LoginResponse, MeResponse, RegisterResponse,
+    LoginRequest, LoginResponse, MeResponse, PackfileDownloadResponse, PackfileResponse,
+    RegisterResponse,
 };
-use atuin_domain::record::{EncryptedData, HostId, Record, RecordIdx, RecordStatus};
+use atuin_domain::caps::{CapClient, CapMismatch, CapabilitiesExt, PackfileCap};
+use atuin_domain::record::{EncryptedData, HostId, Record, RecordId, RecordIdx, RecordStatus};
 
+use reqwest_middleware::ClientWithMiddleware;
 use semver::Version;
 
 static APP_USER_AGENT: &str = concat!("atuin/", env!("CARGO_PKG_VERSION"),);
@@ -46,10 +50,12 @@ impl AuthToken {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct Client {
     sync_addr: Arc<Url>,
-    client: reqwest::Client,
+    client: ClientWithMiddleware,
+    /// Carries no default headers, unlike [`Self::client`]. Used for uploading stuff to S3.
+    upload_client: reqwest::Client,
+    caps: Arc<CapClient>,
 }
 
 /// A [`reqwest::ClientBuilder`] appropriate for the given extra headers.
@@ -250,6 +256,8 @@ impl Client {
         timeout: u64,
         extra_headers: &HashMap<String, String>,
     ) -> Result<Self> {
+        let sync_addr: Arc<Url> = sync_addr.into();
+
         let mut headers = extra_headers_map(extra_headers)?;
         headers.insert(AUTHORIZATION, auth.to_header_value().parse()?);
         headers.insert(USER_AGENT, APP_USER_AGENT.parse()?);
@@ -257,14 +265,57 @@ impl Client {
         // used for semver server check
         headers.insert(ATUIN_HEADER_VERSION, ATUIN_CARGO_VERSION.parse()?);
 
+        // Base authenticated client. `client` wraps it in CapMiddleware for the negotiated API;
+        // `CapClient` keeps a bare clone for its own capability fetches (the caps route is
+        // unnegotiated, so it must bypass the middleware).
+        let base = client_builder(extra_headers)
+            .default_headers(headers)
+            .connect_timeout(Duration::from_secs(connect_timeout))
+            .timeout(Duration::from_secs(timeout))
+            .build()?;
+
+        // `CapClient::new` eagerly kicks off the capability fetch in the background, so the packfile
+        // gate has an answer ready (or blocks on the in-flight fetch) by the first sync.
+        let caps = CapClient::new(sync_addr.append_path("api/v0/capabilities")?, base.clone());
+        // A node's own `record_count` is inert -- it is never sent, and only the server's advertised
+        // value governs packing (see `packfile_record_count`), so 0 is a fine placeholder here.
+        caps.add(PackfileCap {
+            version: 1,
+            record_count: 0,
+        })
+        .expect("packfile cap registered once");
+
+        let client = base.with_capabilities(caps.clone(), CapMismatch::Continue);
+
         Ok(Client {
-            sync_addr: sync_addr.into(),
-            client: client_builder(extra_headers)
-                .default_headers(headers)
+            sync_addr,
+            client,
+            upload_client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(connect_timeout))
                 .timeout(Duration::from_secs(timeout))
                 .build()?,
+            caps,
         })
+    }
+
+    /// How many history records the server wants bundled into each packfile, or `None` if the
+    /// server does not advertise usable packfile support -- its capabilities are unfetched, it does
+    /// not advertise [`PackfileCap`], the advertisement is malformed, or the advertised count is
+    /// zero.
+    ///
+    /// Blocks on the eager capability warm-up kicked off in [`Self::new`] if it is still in flight;
+    /// otherwise a pure cache read. This is the source of the pack size -- `None` means "do not
+    /// pack", the same condition under which the sync path skips packfile upload/download.
+    pub async fn packfile_record_count(&self) -> Option<u64> {
+        match self.caps.get_server::<PackfileCap>().await {
+            Ok(Some(cap)) if cap.record_count > 0 => Some(cap.record_count),
+            _ => None,
+        }
+    }
+
+    /// Whether the server has confirmed it supports packfiles.
+    pub async fn packfiles_enabled(&self) -> bool {
+        self.packfile_record_count().await.is_some()
     }
 
     pub async fn me(&self) -> Result<MeResponse> {
@@ -297,6 +348,68 @@ impl Client {
         handle_resp_error(resp).await?;
 
         Ok(())
+    }
+
+    /// Upload the given packfile.
+    pub async fn upload_packfile(
+        &self,
+        manifest_id: RecordId,
+        record_ids: &[RecordId],
+        packfile: impl Deref<Target = [u8]> + Into<reqwest::Body>,
+    ) -> Result<()> {
+        let url = self.sync_addr.append_path("api/v0/packfiles")?;
+        let body = serde_json::json!({
+            "manifest_id": manifest_id,
+            "records": record_ids,
+            "packfile_size_bytes": packfile.len(),
+        });
+        let resp = self.client.post(url).json(&body).send().await?;
+        let resp = handle_resp_error(resp).await?;
+
+        let parsed: PackfileResponse = resp.json().await?;
+
+        // Awesome, we got the packfile response, let's proceed uploading it up now.
+        self.put_packfile(parsed.upload_url, packfile).await?;
+
+        Ok(())
+    }
+
+    /// Upload a packfile body to a presigned URL. Unauthenticated by design.
+    async fn put_packfile(
+        &self,
+        upload_url: Url,
+        packfile: impl Into<reqwest::Body>,
+    ) -> Result<()> {
+        // Not self.client: S3 rejects presigned requests that also carry an Authorization header.
+        let resp = self
+            .upload_client
+            .put(upload_url.clone())
+            .body(packfile)
+            .send()
+            .await?;
+        handle_resp_error(resp).await?;
+        Ok(())
+    }
+
+    async fn get_packfile_download_url(&self, manifest_id: RecordId) -> Result<Url> {
+        // `append_path` takes `&'static str`; the manifest id is dynamic, so inline its logic.
+        let path = format!("api/v0/packfiles/{}", manifest_id.0);
+        let url = self
+            .sync_addr
+            .append(path.split('/').filter(|s| !s.is_empty()))?;
+        let resp = self.client.get(url).send().await?;
+        let resp = handle_resp_error(resp).await?;
+
+        let parsed: PackfileDownloadResponse = resp.json().await?;
+        Ok(parsed.download_url)
+    }
+
+    /// Dowload the packfile for the given manifest id.
+    pub async fn get_packfile(&self, manifest_id: RecordId) -> Result<Vec<u8>> {
+        let download_url = self.get_packfile_download_url(manifest_id).await?;
+        let resp = self.upload_client.get(download_url).send().await?;
+        let resp = handle_resp_error(resp).await?;
+        Ok(resp.bytes().await?.to_vec())
     }
 
     pub async fn next_records(
@@ -495,5 +608,39 @@ mod tests {
 
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.url().path(), "/ok");
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn bootstrap_enables_packfiles_then_is_idempotent() {
+        use atuin_domain::caps::{CapServer, CapabilitiesCap};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A server advertising PackfileCap; serve its exact wire document.
+        let advertised = CapServer::new()
+            .add(CapabilitiesCap { version: 1 })
+            .unwrap()
+            .add(PackfileCap {
+                version: 1,
+                record_count: 500,
+            })
+            .unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(advertised.body().to_owned()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let addr: Url = server.uri().parse().unwrap();
+        let client =
+            Client::new(addr, AuthToken::Token("t".into()), 30, 30, &HashMap::new()).unwrap();
+
+        assert!(client.packfiles_enabled().await);
+        // A second read stays warm (the mock expects a single fetch) and exposes the pack size.
+        assert_eq!(client.packfile_record_count().await, Some(500));
     }
 }
