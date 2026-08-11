@@ -304,16 +304,9 @@ impl Client {
         })
     }
 
-    /// Whether the server advertises usable packfile support -- it advertises [`PackfileCap`] with a
-    /// positive `record_count`. Gates the packfile sync path.
-    ///
-    /// Blocks on the eager capability warm-up kicked off in [`Self::new`] if it is still in flight;
-    /// otherwise a pure cache read.
-    pub async fn packfiles_enabled(&self) -> bool {
-        matches!(
-            self.caps.get_server::<PackfileCap>().await,
-            Ok(Some(cap)) if cap.record_count > 0
-        )
+    /// The capability reader this client negotiates against.
+    pub fn caps(&self) -> &Arc<CapClient> {
+        &self.caps
     }
 
     pub async fn me(&self) -> Result<MeResponse> {
@@ -645,8 +638,21 @@ mod tests {
         )
         .unwrap();
 
-        assert!(client.packfiles_enabled().await);
-        // A second read stays warm -- the mock expects a single capabilities fetch.
-        assert!(client.packfiles_enabled().await);
+        // The client observes the server's advertised packfile cap; a second read stays warm
+        // (the mock expects a single capabilities fetch).
+        assert_eq!(
+            client.caps().get_server::<PackfileCap>().await.unwrap(),
+            Some(PackfileCap {
+                version: 1,
+                record_count: 500,
+            })
+        );
+        assert_eq!(
+            client.caps().get_server::<PackfileCap>().await.unwrap(),
+            Some(PackfileCap {
+                version: 1,
+                record_count: 500,
+            })
+        );
     }
 }
