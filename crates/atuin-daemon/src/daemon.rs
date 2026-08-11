@@ -463,8 +463,7 @@ impl DaemonBuilder {
         // Create the event bus
         let (event_tx, _) = broadcast::channel(64);
 
-        // Build the capability reader against the public capabilities endpoint. It warms itself in
-        // the background; a missing/offline server leaves it empty, which reads as "do not pack".
+        // Build the capability reader against the public capabilities endpoint.
         let caps = CapClient::new(
             self.settings
                 .sync_address
