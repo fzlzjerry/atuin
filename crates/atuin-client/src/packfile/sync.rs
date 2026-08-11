@@ -240,6 +240,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use atuin_domain::caps::PackfileCap;
+
     use crate::api_client::{AuthToken, Client};
     use crate::history::HISTORY_TAG;
     use crate::packfile::{PACKFILE_TAG, try_pack};
@@ -327,7 +329,17 @@ mod tests {
 
         // Seed history, then let the packer author a manifest over it.
         seed_history(&store, host, &key, 5).await;
-        try_pack(&store, host, 5, HISTORY_TAG).await.unwrap();
+        try_pack(
+            &store,
+            host,
+            Some(PackfileCap {
+                version: 1,
+                record_count: 5,
+            }),
+            HISTORY_TAG,
+        )
+        .await
+        .unwrap();
         let manifest = store
             .last(host, PACKFILE_TAG)
             .await
@@ -371,7 +383,17 @@ mod tests {
         // The UPLOADER's store: seed history, author a manifest, build the blob it would ship.
         let up = memory_store().await;
         seed_history(&up, host, &key, 5).await;
-        try_pack(&up, host, 5, HISTORY_TAG).await.unwrap();
+        try_pack(
+            &up,
+            host,
+            Some(PackfileCap {
+                version: 1,
+                record_count: 5,
+            }),
+            HISTORY_TAG,
+        )
+        .await
+        .unwrap();
         let manifest = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
         let (blob, _ids) = PackManifestRecordView::new(&manifest)
             .unwrap()
@@ -416,7 +438,17 @@ mod tests {
         let host = HostId(uuid_v7());
         let up = memory_store().await;
         seed_history(&up, host, &key, 5).await;
-        try_pack(&up, host, 5, HISTORY_TAG).await.unwrap();
+        try_pack(
+            &up,
+            host,
+            Some(PackfileCap {
+                version: 1,
+                record_count: 5,
+            }),
+            HISTORY_TAG,
+        )
+        .await
+        .unwrap();
         let manifest = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
 
         // Downloader that already HAS the history the manifest covers.
@@ -487,7 +519,17 @@ mod tests {
         // `download_packed_populates_history_from_the_packfile`.
         let up = memory_store().await;
         seed_history(&up, host, &key, 3).await;
-        try_pack(&up, host, 3, HISTORY_TAG).await.unwrap();
+        try_pack(
+            &up,
+            host,
+            Some(PackfileCap {
+                version: 1,
+                record_count: 3,
+            }),
+            HISTORY_TAG,
+        )
+        .await
+        .unwrap();
         let good = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
         let (blob, _ids) = PackManifestRecordView::new(&good)
             .unwrap()

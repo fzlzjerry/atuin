@@ -837,7 +837,17 @@ mod packfile_download_tests {
     ) -> (Record<EncryptedData>, Vec<u8>, Vec<RecordId>) {
         let up = memory_store().await;
         seed_history(&up, host, key, count).await;
-        try_pack(&up, host, count, HISTORY_TAG).await.unwrap();
+        try_pack(
+            &up,
+            host,
+            Some(PackfileCap {
+                version: 1,
+                record_count: count,
+            }),
+            HISTORY_TAG,
+        )
+        .await
+        .unwrap();
         let manifest = up.last(host, PACKFILE_TAG).await.unwrap().unwrap();
         let (blob, ids) = PackManifestRecordView::new(&manifest)
             .unwrap()

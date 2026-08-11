@@ -1,5 +1,6 @@
 //! Turns accumulated history into plaintext `packfile` manifest records.
 
+use atuin_domain::caps::PackfileCap;
 use atuin_domain::record::{EncryptedData, Host, HostId, Record};
 use thiserror::Error;
 use tracing::{instrument, trace};
@@ -33,11 +34,14 @@ pub enum PackingError {
 pub async fn try_pack(
     store: &SqliteStore,
     host: HostId,
-    count: u64,
+    cap: Option<PackfileCap>,
     tag: &str,
 ) -> Result<(), PackingError> {
     debug_assert!(tag != PACKFILE_TAG);
-    debug_assert!(count > 0, "pack size must be positive");
+
+    let Some(count) = cap.map(|c| c.record_count).filter(|&n| n > 0) else {
+        return Ok(());
+    };
 
     // Floor comes from the manifest (`packfile`) stream, not the source `tag`: the newest
     // manifest's `end_idx` is the highest source idx already packed.
@@ -162,7 +166,17 @@ mod tests {
     }
 
     async fn pack(store: &SqliteStore, host: HostId, count: u64) {
-        try_pack(store, host, count, HISTORY_TAG).await.unwrap();
+        try_pack(
+            store,
+            host,
+            Some(PackfileCap {
+                version: 1,
+                record_count: count,
+            }),
+            HISTORY_TAG,
+        )
+        .await
+        .unwrap();
     }
 
     /// One concrete example for readability; the proptests below prove the general invariants.
