@@ -33,11 +33,6 @@ pub struct PackfileCap {
     pub version: u32,
 
     /// How many history records the client should bundle into each packfile manifest.
-    ///
-    /// This is a server-authoritative directive: the client reads it from the server's
-    /// advertisement to size its packing, replacing any client-side default. The count a node
-    /// carries in its *own* advertisement is not meaningful -- only the server's value governs
-    /// packing.
     pub record_count: u64,
 }
 

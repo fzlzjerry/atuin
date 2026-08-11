@@ -255,7 +255,14 @@ mod tests {
 
     /// A [`Client`] pointed at a wiremock server, authenticated with a dummy token.
     fn mock_client(addr: &url::Url) -> Client {
-        Client::new(addr.clone(), AuthToken::Token("t".into()), 30, 30, &HashMap::new()).unwrap()
+        Client::new(
+            addr.clone(),
+            AuthToken::Token("t".into()),
+            30,
+            30,
+            &HashMap::new(),
+        )
+        .unwrap()
     }
 
     /// A fresh in-memory record store.
