@@ -16,7 +16,7 @@ use atuin_domain::api::{
     LoginRequest, LoginResponse, MeResponse, PackfileDownloadResponse, PackfileResponse,
     RegisterResponse,
 };
-use atuin_domain::caps::{CapClient, CapMismatch, CapabilitiesExt, PackfileCap};
+use atuin_domain::caps::{CapClient, CapMismatch, CapabilitiesExt};
 use atuin_domain::record::{EncryptedData, HostId, Record, RecordId, RecordIdx, RecordStatus};
 
 use reqwest_middleware::ClientWithMiddleware;
@@ -604,7 +604,7 @@ mod tests {
     #[rstest]
     #[tokio::test]
     async fn bootstrap_enables_packfiles_then_is_idempotent() {
-        use atuin_domain::caps::{CapServer, CapabilitiesCap};
+        use atuin_domain::caps::{CapServer, CapabilitiesCap, PackfileCap};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
