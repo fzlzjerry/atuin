@@ -304,24 +304,16 @@ impl Client {
         })
     }
 
-    /// How many history records the server wants bundled into each packfile, or `None` if the
-    /// server does not advertise usable packfile support -- its capabilities are unfetched, it does
-    /// not advertise [`PackfileCap`], the advertisement is malformed, or the advertised count is
-    /// zero.
+    /// Whether the server advertises usable packfile support -- it advertises [`PackfileCap`] with a
+    /// positive `record_count`. Gates the packfile sync path.
     ///
     /// Blocks on the eager capability warm-up kicked off in [`Self::new`] if it is still in flight;
-    /// otherwise a pure cache read. This is the source of the pack size -- `None` means "do not
-    /// pack", the same condition under which the sync path skips packfile upload/download.
-    pub async fn packfile_record_count(&self) -> Option<u64> {
-        match self.caps.get_server::<PackfileCap>().await {
-            Ok(Some(cap)) if cap.record_count > 0 => Some(cap.record_count),
-            _ => None,
-        }
-    }
-
-    /// Whether the server has confirmed it supports packfiles.
+    /// otherwise a pure cache read.
     pub async fn packfiles_enabled(&self) -> bool {
-        self.packfile_record_count().await.is_some()
+        matches!(
+            self.caps.get_server::<PackfileCap>().await,
+            Ok(Some(cap)) if cap.record_count > 0
+        )
     }
 
     pub async fn me(&self) -> Result<MeResponse> {
@@ -654,7 +646,7 @@ mod tests {
         .unwrap();
 
         assert!(client.packfiles_enabled().await);
-        // A second read stays warm (the mock expects a single fetch) and exposes the pack size.
-        assert_eq!(client.packfile_record_count().await, Some(500));
+        // A second read stays warm -- the mock expects a single capabilities fetch.
+        assert!(client.packfiles_enabled().await);
     }
 }
