@@ -45,8 +45,7 @@ pub struct DaemonState {
     history_db: HistoryDatabase,
     store: SqliteStore,
 
-    // Reads the server's advertised capabilities (e.g. the packfile record count). Warms itself in
-    // the background against the public `/api/v0/capabilities` endpoint, so no auth is required.
+    // Reads the server's advertised capabilities (e.g. the packfile record count).
     caps: Arc<CapClient>,
 }
 
@@ -161,10 +160,6 @@ impl DaemonHandle {
     // ---- Capabilities ----
 
     /// Get the capability reader for the configured sync server.
-    ///
-    /// Reads the server's advertised capabilities (e.g. the packfile record count). Warms itself in
-    /// the background, so an early read may block briefly on the first fetch and a missing/offline
-    /// server reads as "no capabilities".
     pub fn caps(&self) -> &Arc<CapClient> {
         &self.state.caps
     }
