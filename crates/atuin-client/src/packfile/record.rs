@@ -5,10 +5,8 @@ use std::num::NonZeroU8;
 use atuin_common::encryption::paseto_v4;
 use atuin_domain::record::{
     DecryptedData, EncryptedData, Host, HostId, Record, RecordId, RecordIdx,
-    paseto_v4::ImplicitAssertion,
 };
 use reqwest::Client;
-use rusty_paseto::core::ImplicitAssertion;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -201,15 +199,15 @@ pub enum PackingError {
 #[serde(transparent)]
 struct PackedData(#[serde(with = "serde_bytes")] Vec<u8>);
 
-impl From<Record<DecryptedData>> for Record<PackedData> {
-    fn from(value: Record<DecryptedData>) -> Self {
-        value.with_data::<PackedData>(PackedData(value.data.0))
+impl From<DecryptedData> for PackedData {
+    fn from(value: DecryptedData) -> Self {
+        Self(value.0)
     }
 }
 
-impl From<Record<PackedData>> for Record<DecryptedData> {
-    fn from(value: Record<PackedData>) -> Self {
-        value.with_data::<DecryptedData>(DecryptedData(value.data.0))
+impl From<PackedData> for DecryptedData {
+    fn from(value: PackedData) -> Self {
+        Self(value.0)
     }
 }
 
@@ -217,8 +215,8 @@ impl From<Record<PackedData>> for Record<DecryptedData> {
 /// construction and kept alongside the record, so callers read the range and load the covered
 /// history without re-parsing.
 pub(crate) struct PackManifestRecordView<'a> {
-    record: &'a Record<EncryptedData>,
-    manifest: PackManifestData,
+    pub record: &'a Record<EncryptedData>,
+    pub manifest: PackManifestData,
 }
 
 /// An implicit assertion that matches this [`PackManifestRecordView`].
@@ -230,13 +228,10 @@ struct PackIA {
     pub host: HostId,
 }
 
-impl From<PackIA> for ImplicitAssertion {
-    fn from(value: PackIA) -> Self {
-        ImplicitAssertion(
-            serde_json::to_string(&value)
-                .expect("fixed-layout structure cannot fail serialization")
-                .as_str(),
-        )
+impl PackIA {
+    /// The JSON an [`paseto_v4::ImplicitAssertion`] is built from.
+    fn json(&self) -> String {
+        serde_json::to_string(self).expect("fixed-layout structure cannot fail serialization")
     }
 }
 
@@ -268,7 +263,7 @@ impl<'a> PackManifestRecordView<'a> {
         let count = range.record_count()?;
 
         let run = store
-            .next(self.host_id(), HISTORY_TAG, range.start_idx, count)
+            .next(self.record.host.id, HISTORY_TAG, range.start_idx, count)
             .await
             .map_err(RecordLoadingError::StoreError)?;
 
@@ -282,7 +277,7 @@ impl<'a> PackManifestRecordView<'a> {
         key: paseto_v4::Key,
     ) -> Result<Vec<u8>, PackingError> {
         let encrypted_records = self.load_encrypted_packed_records(store).await?;
-        let ia = self.ia();
+        let ia = self.ia().json();
 
         tokio::task::spawn_blocking(move || {
             // First we need to decrypt the encrypted records. Order of magnitude is about 1000 records.
@@ -290,7 +285,7 @@ impl<'a> PackManifestRecordView<'a> {
                 .map(|r| r.decrypt(&key))
                 // We now need to convert this into a [`PackedData`] record, which, you will note,
                 // is `Serialize` and `Deserialize` unlike the `DecryptedData`.
-                .map(|r| r.map(|r| Into::<Record<PackedData>>::into(r)));
+                .map(|r| r.map(|r| r.map_data(PackedData::from)));
 
             let packed = atuin_common::rmp::serde::try_to_vec(decrypted_records)?;
             let compressed = zstd::stream::encode_all(
@@ -298,7 +293,11 @@ impl<'a> PackManifestRecordView<'a> {
                 Self::ZSTD_ENCODING_LEVEL.map_or(0, |r| r.into()),
             )?;
 
-            let encrypted_data = paseto_v4::encrypt_sync(&compressed, Some(ia), &key)?;
+            let encrypted_data = paseto_v4::encrypt_sync(
+                &compressed,
+                Some(paseto_v4::ImplicitAssertion::from(ia.as_str())),
+                &key,
+            )?;
 
             Ok(rmp_serde::to_vec(&encrypted_data)?)
         })
@@ -327,38 +326,25 @@ impl<'a> PackManifestRecordView<'a> {
         packed_bytes: &[u8],
         key: paseto_v4::Key,
     ) -> Result<Iterator<Item = Record<DecryptedData>>, UnpackError> {
-        let ia = self.ia();
+        let ia = self.ia().json();
 
         tokio::task::spawn_blocking(move || {
             let encrypted: paseto_v4::EncryptedData = rmp_serde::from_slice(packed_bytes)?;
-            let decrypted = paseto_v4::decrypt_sync(&encrypted, Some(ia), &key)?;
+            let decrypted = paseto_v4::decrypt_sync(
+                &encrypted,
+                Some(paseto_v4::ImplicitAssertion::from(ia.as_str())),
+                &key,
+            )?;
             let decompressed = zstd::stream::decode_all(decrypted.as_slice())?;
-            let record_data = rmp_serde::from_slice(&decompressed)?;
+            let record_data: Vec<Record<PackedData>> = rmp_serde::from_slice(&decompressed)?;
 
             Ok(record_data
-                .iter()
-                .map(|r| r.with_data(DecryptedData(r.data.0))))
+                .into_iter()
+                .map(|r| r.map_data(DecryptedData::from)))
         })
         .await
         // SAFETY: The child task should never panic -- if it does, we may as well panic ourselves.
         .unwrap()
-    }
-
-    /// Reverse of [`Self::pack_body`]: decode a fetched body blob into its decrypted records,
-    /// authenticated against this manifest's identity.
-    ///
-    // TODO(codec-merge): now that the codec lives on the view, `unpack_body` is a thin wrapper over
-    // `unpack_records` (was `ManifestRef::unpack` in the deleted `codec` module). Collapse the two
-    // once the caller contract -- return type (`Vec` vs iterator) and borrowed vs owned key -- is
-    // reconciled.
-    pub(crate) async fn unpack_body(
-        &self,
-        blob: Vec<u8>,
-        key: &paseto_v4::Key,
-    ) -> Result<Vec<Record<DecryptedData>>, UnpackError> {
-        self.unpack_records(&blob, key.clone())
-            .await
-            .map(|records| records.collect())
     }
 
     /// Grab the implicit assertion corresponding to

@@ -98,7 +98,7 @@
 //! for a batch), which is responsible for turning that manifest back into local `history` records.
 //!
 //! This operation asks the server for the packfile's presigned download URL, fetches the packfile,
-//! unpacks it (via [`record::PackManifestRecordView::unpack_body`]) back into the individual history
+//! unpacks it (via [`record::PackManifestRecordView::unpack_records`]) back into the individual history
 //! records for the manifest's `"start".."end"` range, re-encrypts each one with the local key, and
 //! pushes them into the local record store.
 mod packer;

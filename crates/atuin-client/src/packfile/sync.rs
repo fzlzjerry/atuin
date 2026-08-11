@@ -64,7 +64,7 @@ pub(crate) async fn upload_packed(
     let (blob, ids) = view.pack_body(store, key).await?;
 
     let (url, packfile_id) = client
-        .create_packfile(view.id(), &ids, blob.len())
+        .create_packfile(view.record.id, &ids, blob.len())
         .await
         .map_err(UploadError::Api)?;
     client
@@ -152,7 +152,7 @@ pub(crate) async fn download_packed(
 ) -> Result<Vec<RecordId>, DownloadError> {
     // Skip if we already have the whole range (history is contiguous, packfiles are prefixes).
     let head = store
-        .last(view.host_id(), HISTORY_TAG)
+        .last(view.record.host.id, HISTORY_TAG)
         .await
         .map_err(DownloadError::Store)?;
     if let Some(head) = head
@@ -166,14 +166,12 @@ pub(crate) async fn download_packed(
         return Ok(existing.map(|r| r.id).collect());
     }
 
-    let blob = client.get_packfile(view.id());
+    let blob = client.get_packfile(view.record.id);
 
-    let decrypted = view.unpack_body(blob, key).await?;
+    let decrypted = view.unpack_records(&blob, key.clone()).await?;
 
-    let encrypted: Vec<Record<EncryptedData>> = decrypted
-        .into_iter()
-        .map(|record| record.encrypt(key))
-        .collect();
+    let encrypted: Vec<Record<EncryptedData>> =
+        decrypted.map(|record| record.encrypt(key)).collect();
     let ids: Vec<RecordId> = encrypted.iter().map(|record| record.id).collect();
 
     store
